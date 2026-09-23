@@ -1,0 +1,49 @@
+report_metadata:
+  client_name: "ООО Доставка Плюс"
+  period_days: 30
+  currency: "₽"
+  theme:
+    primary_color: "1A365D"   # Темно-синий
+    accent_color: "00B4D8"    # Бирюзовый
+    bg_color: "F8F9FA"
+
+slides:
+  - type: "title_slide"
+    title: "Отчет по контекстной рекламе"
+    subtitle: "Яндекс Директ | Итоги месяца"
+
+  - type: "kpi_cards"
+    title: "Ключевые показатели эффективности"
+    metrics:
+      - id: "total_spend"
+        label: "Расход бюджета"
+        format: "currency"
+      - id: "conversions"
+        label: "Получено заявок"
+        format: "integer"
+      - id: "avg_cpa"
+        label: "Средняя стоимость заявки"
+        format: "currency"
+      - id: "avg_ctr"
+        label: "CTR"
+        format: "percent"
+
+  - type: "summary_table"
+    title: "Сводка по рекламным кампаниям"
+    columns:
+      - { field: "CampaignName", header: "Кампания" }
+      - { field: "Cost", header: "Расход, ₽" }
+      - { field: "Clicks", header: "Клики" }
+      - { field: "Conversions", header: "Лиды" }
+      - { field: "CPA", header: "CPA, ₽" }
+    highlight_metric: "CPA"
+
+  - type: "trend_chart"
+    title: "Динамика расходов и конверсий по дням"
+    chart_type: "line"
+    x_axis: "Date"
+    series: ["Cost", "Conversions"]
+
+  - type: "notes_slide"
+    title: "Выводы и план оптимизации"
+    placeholder_text: "Вставьте комментарии специалиста перед отправкой клиенту..."

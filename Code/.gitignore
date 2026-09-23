@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Сгенерированные отчёты не коммитим, сама папка остаётся в репозитории
+output/*
+!output/.gitkeep
