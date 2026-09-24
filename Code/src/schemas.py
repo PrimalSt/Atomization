@@ -365,15 +365,40 @@ Slide = Annotated[
 ]
 
 
+class DirectApiConfig(_ConfigModel):
+    """Параметры выгрузки из Reports API Яндекс Директа."""
+
+    client_login: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        description="Логин клиента для работы из агентского аккаунта (заголовок Client-Login)",
+    )
+    goals: list[PositiveInt] = Field(
+        default_factory=list,
+        max_length=10,  # ограничение параметра Goals в Reports API
+        description="ID целей Метрики; пусто — общее поле Conversions по всем целям",
+    )
+    include_vat: bool = Field(default=True, description="Расход с НДС (IncludeVAT)")
+
+    @field_validator("goals")
+    @classmethod
+    def _unique_goals(cls, goals: list[int]) -> list[int]:
+        _ensure_unique((str(goal) for goal in goals), "goals")
+        return goals
+
+
 class ReportConfig(_ConfigModel):
     """Конфигурация отчёта — структура config/report_config.yaml.
 
     Порядок слайдов и порядок метрик внутри слайда (metrics, columns, series)
     задаётся порядком элементов в YAML; повторы внутри списка запрещены.
+    Секция direct_api необязательна: она нужна только для загрузки из API Директа.
     """
 
     report_metadata: ReportMetadata
     slides: list[Slide] = Field(min_length=1)
+    direct_api: DirectApiConfig = Field(default_factory=DirectApiConfig)
 
     @model_validator(mode="after")
     def _check_has_active_slides(self) -> Self:

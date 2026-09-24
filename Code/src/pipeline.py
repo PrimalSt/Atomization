@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from src.config_loader import DEFAULT_CONFIG_PATH, load_report_config
 from src.data_loader import generate_mock_ad_data, load_ad_records
+from src.direct_client import fetch_campaign_report
 from src.rendering.builder import OUTPUT_DIR, build_presentation
 from src.rendering.formatting import format_value
 from src.schemas import ExpertNotes, ReportConfig, aggregate_by_campaign, calculate_totals
@@ -60,35 +61,43 @@ def generate_report(
     *,
     input_path: str | Path | None = None,
     mock: bool = False,
+    direct: bool = False,
     notes: NotesSource | None = None,
     output: str | Path = OUTPUT_DIR,
     mock_campaigns: int = DEFAULT_MOCK_CAMPAIGNS,
     mock_seed: int | None = None,
+    direct_token: str | None = None,
     today: dt.date | None = None,
 ) -> ReportResult:
     """Выполняет полный цикл и сохраняет презентацию.
 
+    Источник данных — ровно один из ``input_path``, ``mock`` и ``direct``.
+
     Args:
         config_path: YAML-конфиг отчёта.
-        input_path: выгрузка кабинета (.csv, .tsv, .json); взаимоисключающий с ``mock``.
+        input_path: выгрузка кабинета (.csv, .tsv, .json).
         mock: сгенерировать синтетические данные за период из конфига.
+        direct: скачать статистику из Reports API Директа за период из конфига.
         notes: выводы специалиста — текст (упрощённый Markdown), список пунктов или
             ``Path`` к файлу .txt / .md. Строка всегда считается текстом, а не путём.
         output: папка (имя файла сформируется из клиента и периода) или путь к .pptx.
         mock_campaigns: число кампаний в синтетических данных.
         mock_seed: зерно генератора для воспроизводимых синтетических данных.
-        today: «сегодня» для периода синтетических данных и даты формирования.
+        direct_token: OAuth-токен Директа; по умолчанию — YANDEX_DIRECT_TOKEN из окружения или .env.
+        today: «сегодня» для периода отчёта и даты формирования.
 
     Raises:
-        ValueError: источник данных не указан или указаны оба; конфиг, данные или
-            заметки не прошли валидацию.
+        ValueError: источник данных не указан или указано несколько; конфиг, данные
+            или заметки не прошли валидацию.
         FileNotFoundError: нет конфига, файла данных или файла заметок.
         PermissionError: файл отчёта открыт в другой программе.
+        DirectApiError: ошибка API Директа (авторизация, лимиты, очередь отчётов).
     """
-    if input_path is not None and mock:
-        raise ValueError("Укажите один источник данных: файл выгрузки или mock, а не оба")
-    if input_path is None and not mock:
-        raise ValueError("Не указан источник данных: передайте файл выгрузки или включите mock")
+    sources = (input_path is not None) + mock + direct
+    if sources > 1:
+        raise ValueError("Укажите один источник данных: файл выгрузки, mock или API Директа")
+    if sources == 0:
+        raise ValueError("Не указан источник данных: передайте файл выгрузки, включите mock или direct")
     today = today or dt.date.today()
     timings: list[StepTiming] = []
 
@@ -106,6 +115,14 @@ def generate_report(
             if not records:
                 raise ValueError(f"{source.name}: в выгрузке нет ни одной записи")
             details.append(f"{source.name}")
+        elif direct:
+            records = fetch_campaign_report(config, token=direct_token, today=today)
+            if not records:
+                raise ValueError(
+                    "API Директа не вернул статистику за период — проверьте direct_api.client_login "
+                    "и что кампании показывались"
+                )
+            details.append("API Директа")
         else:
             date_from, date_to = config.report_metadata.resolve_period(today=today)
             records = generate_mock_ad_data(
@@ -114,7 +131,7 @@ def generate_report(
             details.append("синтетические")
         period = (min(record.date for record in records), max(record.date for record in records))
         details.append(f"записей: {len(records)}, период {_format_period(period)}")
-    if input_path is not None:
+    if not mock:
         _warn_about_period(config, period, today)
 
     with _step(timings, 3, "Агрегация") as details:

@@ -8,6 +8,8 @@ from pptx import Presentation
 
 import main as cli
 from src.console import LOGGER_NAMES
+from src.data_loader import parse_ad_rows
+from src.direct_client import DirectAuthError
 from src.pipeline import ReportResult, generate_report, resolve_output_path
 from src.rendering.slides.notes import NOTES_SHAPE_NAME
 
@@ -267,3 +269,77 @@ def test_cli_warns_that_seed_needs_mock(tmp_path, csv_file, capsys):
 
     assert code == 0
     assert "только вместе с --mock" in capsys.readouterr().err
+
+
+# --- API Директа --------------------------------------------------------------
+
+
+def direct_records():
+    rows = [row | {"CampaignId": 101 if row["CampaignName"].startswith("Поиск") else 202} for row in ROWS]
+    return parse_ad_rows(rows, "API Директа")
+
+
+def test_direct_source_goes_through_api_client(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_fetch(config, *, token, today):
+        calls.append((config.report_metadata.client_name, token, today))
+        return direct_records()
+
+    monkeypatch.setattr("src.pipeline.fetch_campaign_report", fake_fetch)
+
+    result = generate_report(direct=True, direct_token="token", output=tmp_path, today=TODAY)
+
+    assert calls == [("ООО Доставка Плюс", "token", TODAY)]
+    assert (result.records_count, result.campaigns_count) == (4, 2)
+    assert result.output_path.exists()
+
+
+def test_direct_without_statistics_is_an_error(monkeypatch, tmp_path):
+    monkeypatch.setattr("src.pipeline.fetch_campaign_report", lambda config, **kwargs: [])
+
+    with pytest.raises(ValueError, match="не вернул статистику"):
+        generate_report(direct=True, output=tmp_path)
+
+
+@pytest.mark.parametrize("kwargs", [{"mock": True, "direct": True}, {"direct": True, "input_path": "export.csv"}])
+def test_direct_is_exclusive_with_other_sources(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="один источник данных"):
+        generate_report(output=tmp_path, **kwargs)
+
+
+def test_cli_direct_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr("src.pipeline.fetch_campaign_report", lambda config, **kwargs: direct_records())
+
+    code = cli.main(["--direct", "-o", str(tmp_path), "--no-color"])
+
+    out, err = capsys.readouterr()
+    assert code == 0
+    assert report_path_from(out).exists()
+    assert "API Директа; записей: 4" in err
+
+
+def test_cli_direct_api_error_exit_code(monkeypatch, tmp_path, capsys):
+    def fail(config, **kwargs):
+        raise DirectAuthError("Ошибка авторизации в API Директа: токен недействителен", status=401)
+
+    monkeypatch.setattr("src.pipeline.fetch_campaign_report", fail)
+
+    code = cli.main(["--direct", "-o", str(tmp_path), "--no-color"])
+
+    assert code == 1
+    assert "токен недействителен" in capsys.readouterr().err
+
+
+def test_cli_direct_without_token(tmp_path, capsys):
+    code = cli.main(["--direct", "-o", str(tmp_path), "--no-color"])
+
+    assert code == 1
+    assert "Не задан OAuth-токен Директа" in capsys.readouterr().err
+
+
+def test_cli_direct_conflicts_with_mock(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["--direct", "--mock"])
+
+    assert exit_info.value.code == 2

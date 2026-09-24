@@ -1,6 +1,7 @@
 """Командная строка генератора отчётов по контекстной рекламе.
 
     python main.py --mock
+    python main.py --direct
     python main.py -i export.csv -n "CPA снизился на 12 %"
     python main.py -i export.json --notes-file notes.md -o reports/
 """
@@ -13,20 +14,25 @@ from pathlib import Path
 
 from src.config_loader import DEFAULT_CONFIG_PATH
 from src.console import configure_logging, paint, supports_color, use_utf8_console
+from src.direct_client import TOKEN_ENV_VAR, DirectApiError
 from src.pipeline import DEFAULT_MOCK_CAMPAIGNS, ReportResult, generate_report
 from src.rendering.builder import OUTPUT_DIR
 
 logger = logging.getLogger("report.cli")
 
-_EXAMPLES = """примеры:
+_EXAMPLES = f"""примеры:
   python main.py --mock
   python main.py --mock --seed 7 -o output/demo.pptx
+  python main.py --direct --notes-file notes.md
   python main.py -i export.csv -n "CPA снизился на 12 %"
   python main.py -i export.csv -n "- Отключили РСЯ-площадки с CPA выше 3 000 ₽\\n- Тестируем новые объявления"
   python main.py -i export.json --notes-file notes.md -o reports/
 
 В --notes последовательность \\n означает перенос строки. Для развёрнутых выводов
 удобнее --notes-file: файл .txt или .md с заголовками (#), абзацами и списками (-, 1.).
+
+--direct берёт OAuth-токен из переменной окружения {TOKEN_ENV_VAR} или файла .env,
+логин клиента и цели Метрики — из секции direct_api конфига.
 """
 
 
@@ -50,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     source = parser.add_mutually_exclusive_group()
     source.add_argument("-i", "--input", type=Path, metavar="ФАЙЛ", help="выгрузка кабинета: .csv, .tsv или .json")
     source.add_argument("--mock", action="store_true", help="сгенерировать синтетические данные за период из конфига")
+    source.add_argument(
+        "--direct", action="store_true", help=f"скачать статистику из API Яндекс Директа (токен — {TOKEN_ENV_VAR})"
+    )
     parser.add_argument(
         "-c", "--config", type=Path, default=DEFAULT_CONFIG_PATH, metavar="YAML",
         help="конфиг отчёта (по умолчанию config/report_config.yaml)",
@@ -79,11 +88,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_utf8_console()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.input is None and not args.mock:
-        parser.error("укажите источник данных: -i/--input ФАЙЛ или --mock")
+    if args.input is None and not args.mock and not args.direct:
+        parser.error("укажите источник данных: -i/--input ФАЙЛ, --mock или --direct")
 
     configure_logging(verbose=args.verbose, color=not args.no_color)
-    if args.input is not None and (args.campaigns is not None or args.seed is not None):
+    if not args.mock and (args.campaigns is not None or args.seed is not None):
         logger.warning("--campaigns и --seed действуют только вместе с --mock — параметры не применены")
     notes = args.notes.replace("\\n", "\n") if args.notes is not None else args.notes_file
 
@@ -92,6 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.config,
             input_path=args.input,
             mock=args.mock,
+            direct=args.direct,
             notes=notes,
             output=args.output,
             mock_campaigns=args.campaigns or DEFAULT_MOCK_CAMPAIGNS,
@@ -101,6 +111,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("Нет доступа к файлу %s — если отчёт открыт в PowerPoint, закройте его", exc.filename or exc)
         return 1
     except (OSError, ValueError) as exc:  # pydantic.ValidationError — подкласс ValueError
+        logger.error("%s", exc)
+        return 1
+    except DirectApiError as exc:
         logger.error("%s", exc)
         return 1
     except KeyboardInterrupt:

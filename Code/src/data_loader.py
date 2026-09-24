@@ -14,7 +14,7 @@ import json
 import logging
 import random
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -237,20 +237,29 @@ def load_ad_records(path: str | Path) -> list[DailyAdRecord]:
         ValueError: неподдерживаемый формат или невалидная строка (с её номером).
     """
     source = Path(path)
+    return parse_ad_rows(_read_rows(source), source.name)
+
+
+def parse_ad_rows(rows: Iterable[Any], source_name: str) -> list[DailyAdRecord]:
+    """Валидирует строки выгрузки (словари с колонками Директа) — общий путь для файлов и API.
+
+    Raises:
+        ValueError: строка не словарь или не прошла валидацию; в сообщении — её номер.
+    """
     records = []
     synthetic_ids = 0
-    for number, row in enumerate(_read_rows(source), start=1):
+    for number, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
-            raise ValueError(f"{source.name}, запись {number}: ожидается объект, получено {row!r}")
+            raise ValueError(f"{source_name}, запись {number}: ожидается объект, получено {row!r}")
         prepared = _with_campaign_id(row)
         synthetic_ids += prepared is not row
         try:
             records.append(DailyAdRecord.model_validate(prepared))
         except ValidationError as exc:
-            raise ValueError(f"{source.name}, запись {number}: {exc}") from exc
+            raise ValueError(f"{source_name}, запись {number}: {exc}") from exc
     if synthetic_ids:
-        logger.info("%s: нет CampaignId — ID %d записей выведены из названий кампаний", source.name, synthetic_ids)
-    logger.debug("%s: прочитано и провалидировано %d записей", source.name, len(records))
+        logger.info("%s: нет CampaignId — ID %d записей выведены из названий кампаний", source_name, synthetic_ids)
+    logger.debug("%s: прочитано и провалидировано %d записей", source_name, len(records))
     return records
 
 

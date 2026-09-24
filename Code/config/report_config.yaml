@@ -9,6 +9,13 @@ report_metadata:
     heading_font: "Calibri"
     body_font: "Calibri"
 
+# Загрузка напрямую из Reports API Директа (python main.py --direct).
+# Токен — в переменной окружения YANDEX_DIRECT_TOKEN или в файле .env.
+direct_api:
+  client_login: null   # логин клиента, если токен агентский (заголовок Client-Login)
+  goals: []            # ID целей Метрики; пусто — общее поле Conversions
+  include_vat: true    # расход с НДС
+
 slides:
   - type: "title_slide"
     title: "Отчет по контекстной рекламе"

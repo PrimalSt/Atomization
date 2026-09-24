@@ -15,6 +15,7 @@
 │   ├── pipeline.py          # generate_report(): конфиг → данные → агрегация → презентация
 │   ├── schemas.py           # Pydantic-модели: данные, агрегаты, конфиг, выводы специалиста
 │   ├── data_loader.py       # выгрузки кабинета (CSV/TSV/JSON) и генератор тестовых данных
+│   ├── direct_client.py     # Reports API Яндекс Директа: запрос, очередь отчётов, разбор TSV
 │   ├── config_loader.py     # чтение и валидация report_config.yaml
 │   ├── console.py           # UTF-8 в консоли Windows, цвета, формат логов
 │   └── rendering/
@@ -50,6 +51,9 @@ pytest                          # тесты
 # Синтетические данные за период из конфига → output/report_<клиент>_<период>.pptx
 python main.py --mock
 
+# Статистика напрямую из кабинета Яндекс Директа (см. раздел «API Яндекс Директа»)
+python main.py --direct --notes-file notes.md
+
 # Выгрузка кабинета (.csv, .tsv, .json) и короткий вывод специалиста
 python main.py -i export.csv -n "CPA снизился на 12 % за счёт отключения площадок РСЯ"
 
@@ -66,7 +70,8 @@ python main.py --mock --campaigns 6 --seed 42
 | Флаг | Назначение |
 |---|---|
 | `-i`, `--input ФАЙЛ` | выгрузка кабинета: `.csv` (разделитель `,` или `;`), `.tsv`, `.json` |
-| `--mock` | синтетические данные вместо файла (взаимоисключающий с `-i`) |
+| `--mock` | синтетические данные вместо файла |
+| `--direct` | статистика из Reports API Директа за период из конфига |
 | `-c`, `--config YAML` | конфиг отчёта, по умолчанию `config/report_config.yaml` |
 | `-o`, `--output ПУТЬ` | папка (имя файла — из клиента и периода) или файл `.pptx`; по умолчанию `output/` |
 | `-n`, `--notes ТЕКСТ` | выводы специалиста для слайда `notes_slide` |
@@ -75,10 +80,63 @@ python main.py --mock --campaigns 6 --seed 42
 | `-v`, `--verbose` | подробный лог (DEBUG): загрузка файлов, каждый слайд |
 | `--no-color` | без цветов; они отключаются и сами при перенаправлении вывода или с `NO_COLOR` |
 
+Источник данных — ровно один из `-i`, `--mock`, `--direct`.
 Лог шагов идёт в stderr, итог (путь к отчёту, период, время по шагам) — в stdout,
 поэтому путь можно забрать скриптом: `python main.py --mock 2>$null` (PowerShell).
 Коды выхода: `0` — отчёт собран, `1` — ошибка входных данных (нет файла, невалидный
-конфиг или выгрузка, отчёт открыт в PowerPoint), `2` — неверные аргументы.
+конфиг или выгрузка, ошибка API Директа, отчёт открыт в PowerPoint), `2` — неверные аргументы.
+
+## API Яндекс Директа
+
+`--direct` скачивает суточную статистику кампаний из [Reports API v5](https://yandex.ru/dev/direct/doc/reports/reports.html)
+за период отчёта: `period_days` дней по вчерашний день включительно (или по `date_to` из конфига).
+
+**Токен.** Нужен OAuth-токен с доступом к API Директа. Он берётся из переменной окружения
+`YANDEX_DIRECT_TOKEN`, а если её нет — из файла `.env` в корне проекта:
+
+```bash
+copy .env.example .env          # Linux/macOS: cp .env.example .env
+# впишите токен: YANDEX_DIRECT_TOKEN=y0_...
+python main.py --direct
+```
+
+`.env` исключён из git. Не передавайте токен аргументом командной строки: он останется
+в истории оболочки.
+
+**Настройки** — секция `direct_api` конфига (вся секция необязательна):
+
+```yaml
+direct_api:
+  client_login: "client-login"   # логин клиента, если токен агентский (заголовок Client-Login)
+  goals: [12345678, 87654321]    # ID целей Метрики (до 10); пусто — общее поле Conversions
+  include_vat: true              # расход с НДС (IncludeVAT)
+```
+
+С целями Директ возвращает конверсии отдельной колонкой на каждую цель
+(`Conversions_<цель>_<модель атрибуции>`); в отчёт идёт их сумма по целям из конфига.
+
+**Как идёт запрос.** `CAMPAIGN_PERFORMANCE_REPORT`, `CUSTOM_DATE`, формат TSV, суммы в
+рублях (`returnMoneyInMicros: false`), `processingMode: auto`. Если отчёт в очереди
+(HTTP 201/202), тот же запрос повторяется через `retryIn` секунд (по умолчанию 5), до
+12 попыток; каждое ожидание видно в логе. Временные ошибки сервера (5xx) и сбои сети
+тоже повторяются.
+
+| Ошибка | Когда | Что делать |
+|---|---|---|
+| `DirectAuthError` | нет токена; HTTP 401/403; коды 53, 54, 58, 513 | проверить токен и `client_login` |
+| `DirectLimitError` | HTTP 429; коды 56, 152, 506, 9000 (запросы, баллы, соединения, очередь) | повторить позже |
+| `DirectReportTimeout` | отчёт не готов после 12 попыток | повторить запуск — Директ доформирует отчёт |
+| `DirectApiError` | прочие ошибки запроса | текст ошибки Директа и `RequestId` — в сообщении |
+
+Из Python — `generate_report(direct=True)` или сам клиент:
+
+```python
+from src.config_loader import load_report_config
+from src.direct_client import SANDBOX_REPORTS_URL, fetch_campaign_report
+
+records = fetch_campaign_report(load_report_config())                       # list[DailyAdRecord]
+sandbox = fetch_campaign_report(load_report_config(), url=SANDBOX_REPORTS_URL)  # песочница Директа
+```
 
 ### Формат выводов специалиста
 
@@ -110,7 +168,7 @@ from src.pipeline import generate_report
 
 result = generate_report(
     "config/report_config.yaml",
-    input_path="export.csv",            # или mock=True
+    input_path="export.csv",            # или mock=True, или direct=True
     notes=Path("notes.md"),             # Path — файл; str — текст; list[str] — пункты списка
     output="output/",
 )
