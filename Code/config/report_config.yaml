@@ -9,6 +9,18 @@ report_metadata:
     heading_font: "Calibri"
     body_font: "Calibri"
 
+# Названия колонок в файле выгрузки → колонки Директа (Date, CampaignId, CampaignName,
+# Impressions, Clicks, Cost, Conversions). Нужны, если файл (.xlsx, .xls, .csv, .json)
+# назван по-своему; регистр и лишние пробелы не важны. Колонки, названные как в Директе,
+# сопоставлять не нужно. Вся секция необязательна.
+column_mapping:
+  "Дата": "Date"
+  "Направление": "CampaignName"
+  "Показы": "Impressions"
+  "Клики": "Clicks"
+  "Затраты": "Cost"
+  "Заявки": "Conversions"
+
 # Загрузка напрямую из Reports API Директа (python main.py --direct).
 # Токен — в переменной окружения YANDEX_DIRECT_TOKEN или в файле .env.
 direct_api:

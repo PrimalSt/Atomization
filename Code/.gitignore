@@ -9,3 +9,11 @@ __pycache__/
 # Сгенерированные отчёты не коммитим, сама папка остаётся в репозитории
 output/*
 !output/.gitkeep
+
+# Локальная история отчётов (SQLite) — у каждого пользователя своя
+local_storage/
+
+# Артефакты сборки PyInstaller (python build_exe.py)
+build/
+dist/
+*.spec

@@ -30,6 +30,8 @@ from pydantic.alias_generators import to_pascal
 # Словари допустимых имён — общие для моделей данных и конфига отчёта
 # ---------------------------------------------------------------------------
 
+# Колонки суточной выгрузки (алиасы DailyAdRecord) — цели маппинга column_mapping.
+InputColumn = Literal["Date", "CampaignId", "CampaignName", "Impressions", "Clicks", "Cost", "Conversions"]
 CounterField = Literal["Impressions", "Clicks", "Cost", "Conversions"]
 RatioField = Literal["CTR", "CPC", "CPA", "CR"]
 MetricField = Literal[CounterField, RatioField]
@@ -52,6 +54,7 @@ MetricFormat = Literal["currency", "integer", "percent", "decimal"]
 Money = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
 _HEX_COLOR_PATTERN = r"^[0-9A-F]{6}$"
+_RU_DATE = re.compile(r"(?P<day>\d{1,2})\.(?P<month>\d{1,2})\.(?P<year>\d{4})")
 
 
 def safe_divide(numerator: float, denominator: float, *, scale: float = 1.0) -> float | None:
@@ -122,6 +125,14 @@ class DailyAdRecord(AdCounters):
     date: dt.date = Field(description="Дата статистики")
     campaign_id: PositiveInt = Field(description="ID кампании в кабинете")
     campaign_name: str = Field(min_length=1, max_length=255, description="Название кампании")
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def _parse_russian_date(cls, value: Any) -> Any:
+        """«24.08.2026» — так даты выглядят в выгрузках с русской локалью Excel — в дату."""
+        if isinstance(value, str) and (match := _RU_DATE.fullmatch(value.strip())):
+            return dt.date(int(match["year"]), int(match["month"]), int(match["day"]))
+        return value
 
 
 class PerformanceMetrics(AdCounters):
@@ -394,11 +405,39 @@ class ReportConfig(_ConfigModel):
     Порядок слайдов и порядок метрик внутри слайда (metrics, columns, series)
     задаётся порядком элементов в YAML; повторы внутри списка запрещены.
     Секция direct_api необязательна: она нужна только для загрузки из API Директа.
+    Секция column_mapping необязательна: она переименовывает колонки файла выгрузки
+    («Затраты» → Cost) до валидации строк.
     """
 
     report_metadata: ReportMetadata
     slides: list[Slide] = Field(min_length=1)
     direct_api: DirectApiConfig = Field(default_factory=DirectApiConfig)
+    column_mapping: dict[str, InputColumn] = Field(
+        default_factory=dict,
+        description="Колонка файла выгрузки → колонка в нотации Директа; регистр и лишние пробелы не важны",
+    )
+
+    @field_validator("column_mapping")
+    @classmethod
+    def _check_column_mapping(cls, mapping: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        seen: dict[str, str] = {}  # ключ сравнения → колонка файла, как она записана в конфиге
+        for source, target in mapping.items():
+            name = " ".join(source.split())
+            if not name:
+                raise ValueError("Пустое название колонки файла в column_mapping")
+            key = name.casefold()
+            if key in seen:
+                raise ValueError(f"Колонка «{name}» повторяется в column_mapping (как «{seen[key]}»)")
+            seen[key] = name
+            normalized[name] = target
+        targets: defaultdict[str, list[str]] = defaultdict(list)
+        for source, target in normalized.items():
+            targets[target].append(source)
+        conflicts = [f"{target} ← {', '.join(sources)}" for target, sources in targets.items() if len(sources) > 1]
+        if conflicts:
+            raise ValueError(f"В column_mapping несколько колонок файла ведут в одну колонку: {'; '.join(conflicts)}")
+        return normalized
 
     @model_validator(mode="after")
     def _check_has_active_slides(self) -> Self:

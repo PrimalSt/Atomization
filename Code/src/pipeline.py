@@ -3,8 +3,9 @@
 import datetime as dt
 import logging
 import re
+import sqlite3
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,8 +17,17 @@ from src.config_loader import DEFAULT_CONFIG_PATH, load_report_config
 from src.data_loader import generate_mock_ad_data, load_ad_records
 from src.direct_client import fetch_campaign_report
 from src.rendering.builder import OUTPUT_DIR, build_presentation
+from src.rendering.context import MonthComparison
 from src.rendering.formatting import format_value
-from src.schemas import ExpertNotes, ReportConfig, aggregate_by_campaign, calculate_totals
+from src.schemas import CampaignSummary, ExpertNotes, ReportConfig, aggregate_by_campaign, calculate_totals
+from src.storage import (
+    get_previous_month_metrics,
+    is_full_month,
+    previous_month,
+    report_month_for,
+    save_monthly_metrics,
+    snapshot_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +36,8 @@ NOTES_SUFFIXES = frozenset({".txt", ".md", ".markdown"})
 _STEPS_COUNT = 4
 
 NotesSource = str | Sequence[str] | Path
+# Вызывается в начале каждого шага: (номер шага, всего шагов, название — «Конфиг», «Данные»…).
+ProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +57,9 @@ class ReportResult:
     slides_count: int
     has_notes: bool
     timings: tuple[StepTiming, ...]
+    report_month: str | None = None  # месяц снимка в истории; None — история не велась
+    compared_to: str | None = None  # месяц, к которому посчитана динамика MoM
+    history_saved: bool = False
 
     @property
     def total_seconds(self) -> float:
@@ -68,6 +83,8 @@ def generate_report(
     mock_seed: int | None = None,
     direct_token: str | None = None,
     today: dt.date | None = None,
+    history_db: str | Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> ReportResult:
     """Выполняет полный цикл и сохраняет презентацию.
 
@@ -75,7 +92,8 @@ def generate_report(
 
     Args:
         config_path: YAML-конфиг отчёта.
-        input_path: выгрузка кабинета (.csv, .tsv, .json).
+        input_path: выгрузка кабинета (.csv, .tsv, .json, .xlsx, .xls); колонки
+            переименовываются по column_mapping конфига.
         mock: сгенерировать синтетические данные за период из конфига.
         direct: скачать статистику из Reports API Директа за период из конфига.
         notes: выводы специалиста — текст (упрощённый Markdown), список пунктов или
@@ -85,6 +103,10 @@ def generate_report(
         mock_seed: зерно генератора для воспроизводимых синтетических данных.
         direct_token: OAuth-токен Директа; по умолчанию — YANDEX_DIRECT_TOKEN из окружения или .env.
         today: «сегодня» для периода отчёта и даты формирования.
+        history_db: база SQLite с помесячными итогами. Если задана, карточки KPI показывают
+            динамику к прошлому месяцу, а итоги отчёта сохраняются как снимок его месяца.
+            Синтетические данные в историю не попадают. None — без истории.
+        on_progress: вызывается в начале каждого шага — для индикатора прогресса в GUI.
 
     Raises:
         ValueError: источник данных не указан или указано несколько; конфиг, данные
@@ -101,17 +123,17 @@ def generate_report(
     today = today or dt.date.today()
     timings: list[StepTiming] = []
 
-    with _step(timings, 1, "Конфиг") as details:
+    with _step(timings, 1, "Конфиг", on_progress) as details:
         config = _load_config(config_path)
         expert_notes = _load_notes(notes)
         details.append(f"клиент «{config.report_metadata.client_name}», активных слайдов: {len(config.active_slides)}")
         details.append(f"выводы: {_describe_notes(expert_notes)}")
     _warn_if_notes_unused(config, expert_notes)
 
-    with _step(timings, 2, "Данные") as details:
+    with _step(timings, 2, "Данные", on_progress) as details:
         if input_path is not None:
             source = _existing_file(input_path, "Файл данных")
-            records = load_ad_records(source)
+            records = load_ad_records(source, config.column_mapping)
             if not records:
                 raise ValueError(f"{source.name}: в выгрузке нет ни одной записи")
             details.append(f"{source.name}")
@@ -134,19 +156,43 @@ def generate_report(
     if not mock:
         _warn_about_period(config, period, today)
 
-    with _step(timings, 3, "Агрегация") as details:
+    report_month = None
+    if history_db is not None and mock:
+        logger.info("История: синтетические данные в неё не записываются, динамика MoM не считается")
+    elif history_db is not None:
+        report_month = report_month_for(period)
+        if not is_full_month(period):
+            logger.warning(
+                "Период %s — не полный календарный месяц: итоги сохранятся как снимок %s, "
+                "а динамика MoM сравнит неравные периоды",
+                _format_period(period), report_month,
+            )  # fmt: skip
+
+    with _step(timings, 3, "Агрегация", on_progress) as details:
         summaries = aggregate_by_campaign(records)
         totals = calculate_totals(summaries)
         spend = format_value(totals.cost, "currency", config.report_metadata.currency)
         details.append(f"кампаний: {len(summaries)}, расход {spend}, конверсий: {totals.conversions}")
+        comparison = None
+        if report_month is not None:
+            comparison = _load_comparison(history_db, config.report_metadata.client_name, report_month)
+            details.append(
+                f"MoM: к {comparison.month}" if comparison else f"MoM: в истории нет {previous_month(report_month)}"
+            )
 
-    with _step(timings, 4, "Рендеринг") as details:
+    with _step(timings, 4, "Рендеринг", on_progress) as details:
         target = resolve_output_path(output, config.report_metadata.client_name, period)
-        path = build_presentation(config, summaries, records, target, generated_at=today, notes=expert_notes)
+        path = build_presentation(
+            config, summaries, records, target, generated_at=today, notes=expert_notes, comparison=comparison
+        )
         # Открываем сохранённый файл: это проверка, что он читается, и фактическое число
         # слайдов — длинные выводы специалиста занимают больше одного.
         slides_count = len(Presentation(path).slides)
         details.append(f"слайдов: {slides_count} → {path}")
+
+    history_saved = False
+    if report_month is not None:
+        history_saved = _save_history(history_db, config.report_metadata.client_name, report_month, summaries)
 
     return ReportResult(
         output_path=path,
@@ -156,7 +202,32 @@ def generate_report(
         slides_count=slides_count,
         has_notes=expert_notes is not None,
         timings=tuple(timings),
+        report_month=report_month,
+        compared_to=comparison.month if comparison else None,
+        history_saved=history_saved,
     )
+
+
+def _load_comparison(db_path: str | Path, client_id: str, report_month: str) -> MonthComparison | None:
+    """Итоги прошлого месяца из истории. Сбой базы не должен стоить отчёта — только динамики."""
+    try:
+        snapshot = get_previous_month_metrics(client_id, report_month, db_path=db_path)
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("История недоступна (%s): %s — отчёт соберётся без динамики MoM", db_path, exc)
+        return None
+    if snapshot is None:
+        return None
+    return MonthComparison(month=snapshot["report_month"], metrics=snapshot_metrics(snapshot))
+
+
+def _save_history(db_path: str | Path, client_id: str, report_month: str, summaries: Sequence[CampaignSummary]) -> bool:
+    try:
+        save_monthly_metrics(client_id, report_month, summaries, db_path=db_path)
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("Не удалось сохранить итоги %s в историю (%s): %s", report_month, db_path, exc)
+        return False
+    logger.info("История: итоги «%s» за %s сохранены в %s", client_id, report_month, db_path)
+    return True
 
 
 def resolve_output_path(output: str | Path, client_name: str, period: tuple[dt.date, dt.date]) -> Path:
@@ -175,9 +246,13 @@ def resolve_output_path(output: str | Path, client_name: str, period: tuple[dt.d
 
 
 @contextmanager
-def _step(timings: list[StepTiming], number: int, name: str) -> Iterator[list[str]]:
+def _step(
+    timings: list[StepTiming], number: int, name: str, on_progress: ProgressCallback | None = None
+) -> Iterator[list[str]]:
     """Замеряет шаг и пишет в лог его итог; подробности шаг дописывает в отданный список."""
     details: list[str] = []
+    if on_progress is not None:
+        on_progress(number, _STEPS_COUNT, name)
     logger.debug("[%d/%d] %s…", number, _STEPS_COUNT, name)
     started = time.perf_counter()
     yield details
@@ -208,7 +283,7 @@ def _load_notes(notes: NotesSource | None) -> ExpertNotes | None:
         source = _existing_file(notes, "Файл заметок")
         if source.suffix.lower() not in NOTES_SUFFIXES:
             raise ValueError(f"Файл заметок должен быть .txt или .md, получено «{source.name}»")
-        notes = _read_text(source)
+        notes = read_text_file(source)
     try:
         parsed = ExpertNotes.parse(notes)
     except ValidationError as exc:
@@ -218,7 +293,7 @@ def _load_notes(notes: NotesSource | None) -> ExpertNotes | None:
     return parsed
 
 
-def _read_text(source: Path) -> str:
+def read_text_file(source: Path) -> str:
     """UTF-8 (с BOM или без); старый «Блокнот» сохранял в cp1251 — читаем и его."""
     try:
         return source.read_text(encoding="utf-8-sig")

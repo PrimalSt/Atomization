@@ -4,6 +4,7 @@
     python main.py --direct
     python main.py -i export.csv -n "CPA снизился на 12 %"
     python main.py -i export.json --notes-file notes.md -o reports/
+    python main.py -i export.xlsx --history
 """
 
 import argparse
@@ -17,6 +18,7 @@ from src.console import configure_logging, paint, supports_color, use_utf8_conso
 from src.direct_client import TOKEN_ENV_VAR, DirectApiError
 from src.pipeline import DEFAULT_MOCK_CAMPAIGNS, ReportResult, generate_report
 from src.rendering.builder import OUTPUT_DIR
+from src.storage import DEFAULT_DB_PATH
 
 logger = logging.getLogger("report.cli")
 
@@ -27,12 +29,16 @@ _EXAMPLES = f"""примеры:
   python main.py -i export.csv -n "CPA снизился на 12 %"
   python main.py -i export.csv -n "- Отключили РСЯ-площадки с CPA выше 3 000 ₽\\n- Тестируем новые объявления"
   python main.py -i export.json --notes-file notes.md -o reports/
+  python main.py -i export_2026-09.xlsx --history
 
 В --notes последовательность \\n означает перенос строки. Для развёрнутых выводов
 удобнее --notes-file: файл .txt или .md с заголовками (#), абзацами и списками (-, 1.).
 
 --direct берёт OAuth-токен из переменной окружения {TOKEN_ENV_VAR} или файла .env,
 логин клиента и цели Метрики — из секции direct_api конфига.
+
+--history сохраняет итоги месяца в локальную базу SQLite и показывает на карточках KPI
+динамику к прошлому месяцу, если он уже есть в базе.
 """
 
 
@@ -54,7 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("-i", "--input", type=Path, metavar="ФАЙЛ", help="выгрузка кабинета: .csv, .tsv или .json")
+    source.add_argument(
+        "-i", "--input", type=Path, metavar="ФАЙЛ", help="выгрузка кабинета: .csv, .tsv, .json, .xlsx или .xls"
+    )
     source.add_argument("--mock", action="store_true", help="сгенерировать синтетические данные за период из конфига")
     source.add_argument(
         "--direct", action="store_true", help=f"скачать статистику из API Яндекс Директа (токен — {TOKEN_ENV_VAR})"
@@ -66,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o", "--output", type=Path, default=OUTPUT_DIR, metavar="ПУТЬ",
         help="папка или файл .pptx (по умолчанию output/, имя файла — из клиента и периода)",
+    )  # fmt: skip
+
+    parser.add_argument(
+        "--history", type=Path, nargs="?", const=DEFAULT_DB_PATH, metavar="DB",
+        help="сохранить итоги месяца в локальную историю и показать динамику MoM "
+        "(по умолчанию local_storage/history.db)",
     )  # fmt: skip
 
     notes = parser.add_mutually_exclusive_group()
@@ -106,6 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             mock_campaigns=args.campaigns or DEFAULT_MOCK_CAMPAIGNS,
             mock_seed=args.seed,
+            history_db=args.history,
         )
     except PermissionError as exc:
         logger.error("Нет доступа к файлу %s — если отчёт открыт в PowerPoint, закройте его", exc.filename or exc)
@@ -133,6 +148,10 @@ def _print_summary(result: ReportResult, *, color: bool) -> None:
         f"  период {date_from:%d.%m.%Y} – {date_to:%d.%m.%Y} · записей: {result.records_count} · "
         f"кампаний: {result.campaigns_count} · слайдов: {result.slides_count} · {notes}"
     )
+    if result.report_month is not None:
+        saved = "сохранены" if result.history_saved else "не сохранены (см. предупреждение выше)"
+        mom = f"динамика MoM к {result.compared_to}" if result.compared_to else "прошлого месяца в истории нет"
+        print(f"  история: итоги {result.report_month} {saved} · {mom}")
     print(paint(f"  время: {result.timing_summary()}", "dim", enabled=color))
 
 

@@ -10,6 +10,7 @@ from src.schemas import (
     CampaignSummary,
     DailyAdRecord,
     ExpertNotes,
+    InputColumn,
     KpiCardsSlide,
     ReportConfig,
     SummaryField,
@@ -214,6 +215,43 @@ def test_config_rejects_invalid_values(mutate):
 
     with pytest.raises(ValidationError):
         ReportConfig.model_validate(raw)
+
+
+def test_column_mapping_is_optional_and_normalized():
+    assert ReportConfig.model_validate(base_config()).column_mapping == {}
+
+    raw = base_config() | {"column_mapping": {"  Затраты,   руб. ": "Cost", "Заявки": "Conversions"}}
+
+    assert ReportConfig.model_validate(raw).column_mapping == {"Затраты, руб.": "Cost", "Заявки": "Conversions"}
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        {"Затраты": "Spend"},  # неизвестная колонка Директа
+        {"Затраты": "Cost", "Расход": "Cost"},  # две колонки файла в одну колонку Директа
+        {"Затраты": "Cost", "затраты ": "Clicks"},  # одна колонка файла дважды (регистр и пробелы не важны)
+        {"   ": "Cost"},
+    ],
+)
+def test_column_mapping_rejects_ambiguous_entries(mapping):
+    with pytest.raises(ValidationError, match="column_mapping"):
+        ReportConfig.model_validate(base_config() | {"column_mapping": mapping})
+
+
+def test_input_columns_match_record_aliases():
+    aliases = {field.alias for field in DailyAdRecord.model_fields.values()}
+
+    assert set(get_args(InputColumn)) == aliases
+
+
+def test_record_accepts_russian_date_format():
+    row = {"Date": " 04.09.2026 ", "CampaignId": 1, "CampaignName": "Т"}
+    record = DailyAdRecord.model_validate(row | {"Impressions": 1, "Clicks": 0, "Cost": 0, "Conversions": 0})
+
+    assert record.date == dt.date(2026, 9, 4)
+    with pytest.raises(ValidationError):
+        make_record(day="31.02.2026")
 
 
 def blocks(notes: ExpertNotes) -> list[tuple[str, str]]:

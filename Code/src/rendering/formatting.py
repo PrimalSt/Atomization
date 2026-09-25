@@ -1,7 +1,7 @@
 """Форматирование значений для слайдов: русские разделители, валюта, проценты."""
 
 from dataclasses import dataclass
-from typing import Any, get_args
+from typing import Any, Literal, get_args
 
 from src.schemas import KpiMetricId, MetricFormat, PerformanceMetrics, RatioField
 
@@ -91,25 +91,77 @@ class KpiSource:
     """Откуда брать значение KPI и что написать под ним.
 
     ``formula`` задана у производных метрик; для накопительных под значением
-    показывается среднее за день.
+    показывается среднее за день. Если в истории есть предыдущий месяц, вместо них
+    выводится динамика MoM, а ``better`` решает её цвет.
     """
 
     attribute: str  # поле или вычисляемое поле PerformanceMetrics
     decimals: int = 0
     formula: str | None = None
+    better: Literal["higher", "lower"] | None = None  # None — рост не хорош и не плох (расход)
 
 
 KPI_SOURCES: dict[KpiMetricId, KpiSource] = {
     "total_spend": KpiSource("cost"),
-    "impressions": KpiSource("impressions"),
-    "clicks": KpiSource("clicks"),
-    "conversions": KpiSource("conversions"),
-    "avg_ctr": KpiSource("ctr", decimals=2, formula="клики ÷ показы"),
-    "avg_cpc": KpiSource("cpc", decimals=2, formula="расход ÷ клики"),
-    "avg_cpa": KpiSource("cpa", formula="расход ÷ конверсии"),
-    "avg_cr": KpiSource("cr", decimals=2, formula="конверсии ÷ клики"),
+    "impressions": KpiSource("impressions", better="higher"),
+    "clicks": KpiSource("clicks", better="higher"),
+    "conversions": KpiSource("conversions", better="higher"),
+    "avg_ctr": KpiSource("ctr", decimals=2, formula="клики ÷ показы", better="higher"),
+    "avg_cpc": KpiSource("cpc", decimals=2, formula="расход ÷ клики", better="lower"),
+    "avg_cpa": KpiSource("cpa", formula="расход ÷ конверсии", better="lower"),
+    "avg_cr": KpiSource("cr", decimals=2, formula="конверсии ÷ клики", better="higher"),
 }
 
 
 def kpi_value(metrics: PerformanceMetrics, metric_id: KpiMetricId) -> float | None:
     return getattr(metrics, KPI_SOURCES[metric_id].attribute)
+
+
+# ---------------------------------------------------------------------------
+# Динамика месяц к месяцу (MoM)
+# ---------------------------------------------------------------------------
+
+MONTHS_DATIVE = (
+    "январю", "февралю", "марту", "апрелю", "маю", "июню",
+    "июлю", "августу", "сентябрю", "октябрю", "ноябрю", "декабрю",
+)  # fmt: skip
+
+
+def month_dative(month: str) -> str:
+    """«2026-08» → «августу» — для подписи «▲ 12,4% к августу»."""
+    try:
+        number = int(month.split("-")[1])
+        return MONTHS_DATIVE[number - 1]
+    except (IndexError, ValueError):
+        raise ValueError(f"Ожидается месяц в формате YYYY-MM, получено «{month}»") from None
+
+
+@dataclass(frozen=True, slots=True)
+class Change:
+    """Изменение метрики к прошлому месяцу: подпись и направление (1 — рост, -1 — снижение, 0 — без изменений)."""
+
+    text: str
+    direction: Literal[-1, 0, 1]
+
+
+def month_over_month(current: float | None, previous: float | None, fmt: MetricFormat, month: str) -> Change | None:
+    """Динамика к прошлому месяцу: «▲ 12,4% к августу», «▼ 0,35 п.п. к августу».
+
+    Проценты (CTR, CR) сравниваются разницей в процентных пунктах, остальное —
+    относительным изменением. None — сравнить нельзя: метрика не определена в одном
+    из месяцев или в прошлом месяце была нулевой.
+    """
+    if current is None or previous is None:
+        return None
+    if fmt == "percent":
+        delta = round(current - previous, 2)
+        amount = f"{format_number(abs(delta), 2)}{NBSP}п.п."
+    else:
+        if previous == 0:
+            return None
+        delta = round((current - previous) / previous * 100, 1)
+        amount = f"{format_number(abs(delta), 1)}%"
+    target = f"к{NBSP}{month_dative(month)}"
+    if delta == 0:
+        return Change(f"без изменений {target}", 0)
+    return Change(f"{'▲' if delta > 0 else '▼'}{NBSP}{amount} {target}", 1 if delta > 0 else -1)

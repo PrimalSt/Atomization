@@ -3,6 +3,7 @@ import json
 import logging
 from pathlib import Path
 
+import openpyxl
 import pytest
 from pptx import Presentation
 
@@ -95,6 +96,22 @@ def test_file_inputs(tmp_path, request, source):
     assert result.output_path == (tmp_path / "r.pptx").resolve()
     assert (result.records_count, result.campaigns_count) == (4, 2)
     assert result.period == (dt.date(2026, 9, 20), dt.date(2026, 9, 21))
+
+
+def test_excel_input_uses_column_mapping_from_config(tmp_path):
+    source = tmp_path / "export.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active.append(["Дата", "Направление", "Показы", "Клики", "Затраты", "Заявки"])  # как в конфиге
+    for row in ROWS:
+        workbook.active.append([dt.datetime.fromisoformat(row["Date"]), row["CampaignName"], row["Impressions"],
+                                row["Clicks"], row["Cost"], row["Conversions"]])  # fmt: skip
+    workbook.save(source)
+
+    result = generate_report(input_path=source, output=tmp_path / "r.pptx", today=TODAY)
+
+    assert (result.records_count, result.campaigns_count) == (4, 2)
+    assert result.period == (dt.date(2026, 9, 20), dt.date(2026, 9, 21))
+    assert result.report_month is None  # история — только по запросу
 
 
 def test_markdown_notes_become_headings_paragraphs_and_lists(tmp_path):
