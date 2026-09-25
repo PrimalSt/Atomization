@@ -11,14 +11,23 @@ from pptx.enum.text import PP_ALIGN
 from src.config_loader import load_report_config
 from src.data_loader import generate_mock_ad_data
 from src.rendering.builder import build_presentation
-from src.rendering.formatting import NBSP, format_number, format_value
+from src.rendering.context import MonthComparison
+from src.rendering.formatting import NBSP, format_number, format_value, month_dative, month_over_month
 from src.rendering.primitives import CONTENT_WIDTH
 from src.rendering.slides import SLIDE_RENDERERS
 from src.rendering.slides.notes import paginate_notes
 from src.rendering.slides.summary_table import Deviation, deviation, layout_table
 from src.rendering.slides.trend_chart import axis_number_format, nice_step
 from src.rendering.theme import WHITE, Theme, hex_to_rgb
-from src.schemas import ExpertNotes, ReportConfig, Slide, ThemeConfig, aggregate_by_campaign
+from src.schemas import (
+    ExpertNotes,
+    PerformanceMetrics,
+    ReportConfig,
+    Slide,
+    ThemeConfig,
+    aggregate_by_campaign,
+    calculate_totals,
+)
 
 END = dt.date(2026, 9, 21)
 GENERATED = dt.date(2026, 9, 22)
@@ -102,6 +111,60 @@ def test_kpi_cards_show_formatted_totals(tmp_path, config, records):
     spend = shape_named(slide, "KPI total_spend: значение").text_frame.text
     assert spend == f"{format_number(total_cost)}{NBSP}₽"
     assert shape_named(slide, "KPI avg_ctr: значение").text_frame.text.endswith("%")
+
+
+@pytest.mark.parametrize(
+    ("current", "previous", "fmt", "expected"),
+    [
+        (1100.0, 1000.0, "currency", ("▲ 10,0% к августу", 1)),
+        (450.0, 500.0, "integer", ("▼ 10,0% к августу", -1)),
+        (2.5, 2.0, "percent", ("▲ 0,50 п.п. к августу", 1)),  # проценты — разницей в п.п.
+        (1000.4, 1000.0, "currency", ("без изменений к августу", 0)),
+    ],
+)
+def test_month_over_month_caption(current, previous, fmt, expected):
+    change = month_over_month(current, previous, fmt, "2026-08")
+
+    assert (change.text.replace(NBSP, " "), change.direction) == expected
+
+
+@pytest.mark.parametrize(("current", "previous"), [(None, 10.0), (10.0, None), (10.0, 0.0)])
+def test_month_over_month_is_undefined_without_comparable_values(current, previous):
+    assert month_over_month(current, previous, "currency", "2026-08") is None
+
+
+def test_month_dative():
+    assert [month_dative(f"2026-{number:02d}") for number in (1, 5, 12)] == ["январю", "маю", "декабрю"]
+    with pytest.raises(ValueError):
+        month_dative("август")
+
+
+def test_kpi_cards_color_month_over_month_by_direction(tmp_path, config, records):
+    summaries = aggregate_by_campaign(records)
+    current = calculate_totals(summaries)
+    # Прошлый месяц: больше расход и конверсии, CPA ниже, CTR тот же — нынешний месяц хуже по лидам.
+    previous = PerformanceMetrics(
+        impressions=current.impressions,
+        clicks=current.clicks,
+        cost=current.cost * 1.1,
+        conversions=round(current.conversions * 1.5),
+    )
+    path = build_presentation(
+        config, summaries, records, tmp_path / "mom.pptx", generated_at=GENERATED,
+        comparison=MonthComparison("2026-08", previous),
+    )  # fmt: skip
+    slide = Presentation(path).slides[1]
+    theme = Theme.from_config(config.report_metadata.theme)
+
+    def caption(metric_id: str):
+        run = shape_named(slide, f"KPI {metric_id}: пояснение").text_frame.paragraphs[0].runs[0]
+        return run.text.replace(NBSP, " "), run.font.color.rgb
+
+    spend_text, spend_color = caption("total_spend")
+    assert spend_text.startswith("▼") and spend_color == theme.muted  # расход не хорош и не плох
+    assert caption("conversions")[0].startswith("▼") and caption("conversions")[1] == theme.bad
+    assert caption("avg_cpa")[0].startswith("▲") and caption("avg_cpa")[1] == theme.bad  # CPA вырос — хуже
+    assert caption("avg_ctr") == ("без изменений к августу", theme.muted)
 
 
 def test_summary_table_has_totals_row_and_aligned_columns(tmp_path, config, records):

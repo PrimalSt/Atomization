@@ -17,6 +17,14 @@ from src.schemas import (
 
 
 @dataclass(frozen=True, slots=True)
+class MonthComparison:
+    """Итоги предыдущего месяца из локальной истории — база динамики MoM на карточках KPI."""
+
+    month: str  # «2026-08»
+    metrics: PerformanceMetrics
+
+
+@dataclass(frozen=True, slots=True)
 class RenderContext:
     config: ReportConfig
     theme: Theme
@@ -27,6 +35,7 @@ class RenderContext:
     generated_at: dt.date
     notes: ExpertNotes | None = None  # выводы специалиста; None — на слайде останется заготовка
     notes_layout: tuple[int, int] | None = None  # (кегль, колонок), общие для всех слайдов разбитых выводов
+    comparison: MonthComparison | None = None  # прошлый месяц из истории; None — без динамики MoM
 
     @classmethod
     def from_data(
@@ -36,6 +45,7 @@ class RenderContext:
         daily_records: Sequence[DailyAdRecord],
         generated_at: dt.date,
         notes: ExpertNotes | None = None,
+        comparison: MonthComparison | None = None,
     ) -> "RenderContext":
         """Готовит данные для слайдов.
 
@@ -61,6 +71,7 @@ class RenderContext:
             period=(date_from, date_to),
             generated_at=generated_at,
             notes=notes,
+            comparison=comparison,
         )
 
     @property

@@ -1,13 +1,18 @@
-"""Карточки KPI: крупное значение, подпись и пояснение под ним."""
+"""Карточки KPI: крупное значение, подпись и пояснение под ним.
+
+Пояснение — динамика к прошлому месяцу, если он есть в локальной истории;
+иначе формула (для производных метрик) или среднее за день (для накопительных).
+"""
 
 import math
 
+from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR
 from pptx.slide import Slide
 from pptx.util import Inches, Length
 
 from src.rendering.context import RenderContext
-from src.rendering.formatting import KPI_SOURCES, format_value, kpi_value
+from src.rendering.formatting import KPI_SOURCES, format_value, kpi_value, month_over_month
 from src.rendering.primitives import (
     CARD_PADDING,
     CONTENT_HEIGHT,
@@ -79,10 +84,11 @@ def _render_card(
         font=theme.heading_font, size=value_size, color=theme.primary,
         bold=True, anchor=MSO_ANCHOR.MIDDLE, name=f"KPI {metric.id}: значение",
     )  # fmt: skip
+    caption, caption_color = _caption(metric, value, ctx)
     add_text(
         slide, inner_left, top + height - CARD_PADDING - Inches(0.35), inner_width, Inches(0.35),
-        _caption(metric, value, ctx),
-        font=theme.body_font, size=13, color=theme.muted, anchor=MSO_ANCHOR.BOTTOM,
+        caption,
+        font=theme.body_font, size=13, color=caption_color, anchor=MSO_ANCHOR.BOTTOM,
         name=f"KPI {metric.id}: пояснение",
     )  # fmt: skip
 
@@ -93,7 +99,26 @@ def _fit_font_size(text: str, width: int) -> float:
     return max(_VALUE_MIN_PT, min(_VALUE_MAX_PT, math.floor(fitting)))
 
 
-def _caption(metric: KpiMetric, value: float | None, ctx: RenderContext) -> str:
+def _caption(metric: KpiMetric, value: float | None, ctx: RenderContext) -> tuple[str, RGBColor]:
+    """Текст и цвет пояснения: динамика MoM, если её можно посчитать, иначе справка о метрике."""
+    if ctx.comparison is not None:
+        previous = kpi_value(ctx.comparison.metrics, metric.id)
+        change = month_over_month(value, previous, metric.format, ctx.comparison.month)
+        if change is not None:
+            return change.text, _change_color(metric, change.direction, ctx)
+    return _reference_caption(metric, value, ctx), ctx.theme.muted
+
+
+def _change_color(metric: KpiMetric, direction: int, ctx: RenderContext) -> RGBColor:
+    """Зелёный — изменение к лучшему, красный — к худшему; расход и «без изменений» нейтральны."""
+    better = KPI_SOURCES[metric.id].better
+    if better is None or direction == 0:
+        return ctx.theme.muted
+    improved = (direction > 0) == (better == "higher")
+    return ctx.theme.good if improved else ctx.theme.bad
+
+
+def _reference_caption(metric: KpiMetric, value: float | None, ctx: RenderContext) -> str:
     """Формула для производных метрик, среднее за день — для накопительных."""
     source = KPI_SOURCES[metric.id]
     if source.formula:

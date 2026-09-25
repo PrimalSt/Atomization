@@ -1,5 +1,5 @@
-"""Источники рекламных данных: выгрузки кабинета (CSV/TSV/JSON) и генератор
-тестовой суточной статистики в формате Яндекс Директа.
+"""Источники рекламных данных: выгрузки кабинета (CSV/TSV/JSON, Excel .xlsx/.xls)
+и генератор тестовой суточной статистики в формате Яндекс Директа.
 
 Проверочный запуск из корня проекта:
     python -m src.data_loader
@@ -14,11 +14,14 @@ import json
 import logging
 import random
 import sys
-from collections.abc import Iterable, Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
+import openpyxl
+import xlrd
 from pydantic import ValidationError
 
 if not __package__:  # запуск файлом (python src/data_loader.py): делаем пакет src видимым
@@ -28,6 +31,7 @@ from src.console import configure_logging, use_utf8_console  # noqa: E402
 from src.schemas import (  # noqa: E402
     CampaignSummary,
     DailyAdRecord,
+    InputColumn,
     PerformanceMetrics,
     aggregate_by_campaign,
     calculate_totals,
@@ -187,6 +191,22 @@ def generate_mock_ad_data(
 
 SYNTHETIC_ID_BASE = 10**12  # синтетические ID 13-значные — не пересекаются с 8–9-значными ID Директа
 
+EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls"})
+SUPPORTED_SUFFIXES = frozenset({".csv", ".tsv", ".json"}) | EXCEL_SUFFIXES
+
+INPUT_COLUMNS: tuple[str, ...] = get_args(InputColumn)
+# CampaignId необязателен: без него ID выводится из названия кампании.
+REQUIRED_COLUMNS: tuple[str, ...] = tuple(column for column in INPUT_COLUMNS if column != "CampaignId")
+# Те же поля под именами Python (snake_case) — так их принимает DailyAdRecord.
+_FIELD_NAMES: dict[str, str] = {
+    field.alias: name for name, field in DailyAdRecord.model_fields.items() if field.alias in INPUT_COLUMNS
+}
+
+_ZIP_SIGNATURE = b"PK\x03\x04"  # .xlsx / .xlsm — ZIP-архив Office Open XML
+_OLE2_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # .xls — Excel 97–2003
+_HEADER_SCAN_ROWS = 30  # над таблицей в выгрузках бывают заголовок отчёта, период, фильтры
+_HEADER_MIN_KNOWN = 3  # столько известных колонок должно быть в строке, чтобы счесть её заголовком
+
 
 def campaign_id_from_name(name: str) -> int:
     """Стабильный ID кампании для выгрузок без колонки CampaignId.
@@ -207,7 +227,63 @@ def _with_campaign_id(row: dict[str, Any]) -> dict[str, Any]:
     return {**row, "CampaignId": campaign_id_from_name(name)}
 
 
-def _read_rows(source: Path) -> list[Any]:
+# --- Маппинг колонок --------------------------------------------------------
+
+
+def column_key(name: object) -> str:
+    """Ключ сравнения названий колонок: «  Затраты,  руб. » и «затраты, руб.» совпадают."""
+    return " ".join(str(name).split()).casefold()
+
+
+def _mapping_lookup(column_mapping: Mapping[str, str] | None) -> dict[str, str]:
+    return {column_key(source): target for source, target in (column_mapping or {}).items()}
+
+
+def _rename_columns(row: Mapping[Any, Any], lookup: Mapping[str, str]) -> dict[Any, Any]:
+    if not lookup:
+        return dict(row)
+    renamed: dict[Any, Any] = {}
+    origins: dict[Any, Any] = {}
+    for column, value in row.items():
+        name = lookup.get(column_key(column), column) if isinstance(column, str) else column
+        if name in renamed:
+            raise ValueError(
+                f"колонки «{origins[name]}» и «{column}» обе соответствуют {name} — уточните column_mapping конфига"
+            )
+        renamed[name] = value
+        origins[name] = column
+    return renamed
+
+
+def normalize_columns(row: Mapping[str, Any], column_mapping: Mapping[str, str] | None) -> dict[str, Any]:
+    """Переименовывает колонки строки выгрузки в нотацию Директа по ``column_mapping``.
+
+    Названия сравниваются без учёта регистра и лишних пробелов: при маппинге
+    ``{"Затраты": "Cost"}`` колонка «затраты » тоже станет Cost. Колонки, которых
+    нет в маппинге, остаются как есть — в том числе уже названные по-директовски.
+
+    Raises:
+        ValueError: две колонки строки получают одно имя (например, в файле есть и
+            «Cost», и «Затраты», а маппинг переименовывает «Затраты» в Cost).
+    """
+    return _rename_columns(row, _mapping_lookup(column_mapping))
+
+
+def _check_required_columns(columns: Iterable[Any], source_name: str) -> None:
+    present = {column for column in columns if isinstance(column, str)}
+    missing = [column for column in REQUIRED_COLUMNS if column not in present and _FIELD_NAMES[column] not in present]
+    if missing:
+        found = ", ".join(f"«{column}»" for column in present) or "нет"
+        raise ValueError(
+            f"{source_name}: нет обязательных колонок {', '.join(missing)} (колонки файла: {found}). "
+            "Если в выгрузке они называются иначе, сопоставьте их в секции column_mapping конфига"
+        )
+
+
+# --- Чтение файлов ----------------------------------------------------------
+
+
+def _read_rows(source: Path, lookup: Mapping[str, str]) -> list[Any]:
     suffix = source.suffix.lower()
     if suffix == ".json":
         rows = json.loads(source.read_text(encoding="utf-8-sig"))
@@ -224,35 +300,191 @@ def _read_rows(source: Path) -> list[Any]:
             except csv.Error:
                 delimiter = ","
         return list(csv.DictReader(io.StringIO(text), delimiter=delimiter))
-    raise ValueError(f"{source.name}: неподдерживаемый формат, ожидается .csv, .tsv или .json")
+    if suffix in EXCEL_SUFFIXES:
+        return _read_excel(source, lookup)
+    raise ValueError(f"{source.name}: неподдерживаемый формат, ожидается .csv, .tsv, .json, .xlsx или .xls")
 
 
-def load_ad_records(path: str | Path) -> list[DailyAdRecord]:
+SheetRows = list[tuple[Any, ...]]
+
+
+def _read_excel(source: Path, lookup: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Строки таблицы из книги Excel: первый лист, где нашлась строка заголовков.
+
+    Формат определяется по содержимому, а не по расширению: .xlsx, переименованный
+    в .xls (и наоборот), тоже читается.
+    """
+    with source.open("rb") as book:
+        signature = book.read(len(_OLE2_SIGNATURE))
+    if signature.startswith(_ZIP_SIGNATURE):
+        sheets = _xlsx_sheets(source)
+    elif signature == _OLE2_SIGNATURE:
+        sheets = _xls_sheets(source)
+    else:
+        raise ValueError(
+            f"{source.name}: файл не похож на книгу Excel (.xlsx или .xls) — возможно, это CSV или HTML "
+            "с другим расширением; пересохраните его в Excel как «Книга Excel (.xlsx)»"
+        )
+    return _table_rows(sheets, source.name, lookup)
+
+
+def _xlsx_sheets(source: Path) -> list[tuple[str, SheetRows]]:
+    # openpyxl получает поток, а не путь: по пути он проверяет расширение и отвергает
+    # .xlsx, сохранённый как .xls, а формат здесь уже определён по содержимому.
+    with source.open("rb") as stream:
+        try:
+            workbook = openpyxl.load_workbook(stream, read_only=True, data_only=True)
+            try:
+                return [
+                    (sheet.title, [row for row in sheet.iter_rows(values_only=True) if not _is_blank_row(row)])
+                    for sheet in workbook.worksheets
+                ]
+            finally:
+                workbook.close()
+        except OSError:
+            raise
+        except Exception as exc:  # битый архив или XML: у openpyxl нет общего класса ошибок
+            raise ValueError(f"{source.name}: не удалось прочитать книгу Excel: {exc}") from exc
+
+
+def _xls_sheets(source: Path) -> list[tuple[str, SheetRows]]:
+    try:
+        workbook = xlrd.open_workbook(source, on_demand=True)
+    except xlrd.XLRDError as exc:
+        raise ValueError(f"{source.name}: не удалось прочитать книгу Excel 97–2003: {exc}") from exc
+    try:
+        sheets = []
+        for index in range(workbook.nsheets):
+            sheet = workbook.sheet_by_index(index)
+            rows = [tuple(_xls_value(cell, workbook.datemode) for cell in sheet.row(n)) for n in range(sheet.nrows)]
+            sheets.append((sheet.name, [row for row in rows if not _is_blank_row(row)]))
+        return sheets
+    finally:
+        workbook.release_resources()
+
+
+def _xls_value(cell: xlrd.sheet.Cell, datemode: int) -> Any:
+    match cell.ctype:
+        case xlrd.XL_CELL_EMPTY | xlrd.XL_CELL_BLANK:
+            return None
+        case xlrd.XL_CELL_DATE:
+            return xlrd.xldate.xldate_as_datetime(cell.value, datemode)
+        case xlrd.XL_CELL_BOOLEAN:
+            return bool(cell.value)
+        case xlrd.XL_CELL_ERROR:
+            return xlrd.error_text_from_code.get(cell.value, "#ERROR")
+    return cell.value
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _is_blank_row(row: Sequence[Any]) -> bool:
+    """Пустые строки отбрасываются ещё при чтении: оформленные, но пустые строки до конца листа не копятся."""
+    return all(map(_is_blank, row))
+
+
+def _cell_value(value: Any) -> Any:
+    """Даты Excel приходят как datetime с нулевым временем — для суточной статистики это дата."""
+    if isinstance(value, dt.datetime) and value.time() == dt.time():
+        return value.date()
+    return value
+
+
+def _find_header(rows: SheetRows, lookup: Mapping[str, str]) -> int | None:
+    for index, row in enumerate(rows[:_HEADER_SCAN_ROWS]):
+        names = {lookup.get(column_key(cell), str(cell).strip()) for cell in row if not _is_blank(cell)}
+        if len(names & set(INPUT_COLUMNS)) >= _HEADER_MIN_KNOWN:
+            return index
+    return None
+
+
+def _locate_table(
+    sheets: list[tuple[str, SheetRows]], lookup: Mapping[str, str]
+) -> tuple[str, SheetRows, int] | None:
+    """Лист и номер строки заголовков: (название листа, строки листа, индекс заголовка).
+
+    Заголовок — первая строка (в пределах первых ``_HEADER_SCAN_ROWS``), где с учётом
+    маппинга есть хотя бы ``_HEADER_MIN_KNOWN`` колонок Директа. Если такой нет ни на
+    одном листе, заголовком считается первая непустая строка первого непустого листа:
+    тогда проверка колонок перечислит, каких не хватает. None — книга пустая.
+    """
+    for title, rows in sheets:
+        header_index = _find_header(rows, lookup)
+        if header_index is not None:
+            return title, rows, header_index
+    for title, rows in sheets:
+        if rows:  # пустые строки отброшены при чтении — первая строка и есть первая непустая
+            return title, rows, 0
+    return None
+
+
+def _table_rows(
+    sheets: list[tuple[str, SheetRows]], source_name: str, lookup: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """Строки таблицы под заголовком — словари «колонка → значение»; пустые строки пропускаются."""
+    located = _locate_table(sheets, lookup)
+    if located is None:
+        return []
+    title, rows, header_index = located
+
+    header = ["" if _is_blank(cell) else " ".join(str(cell).split()) for cell in rows[header_index]]
+    duplicates = sorted(name for name, count in Counter(filter(None, header)).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"{source_name}, лист «{title}»: повторяются колонки {', '.join(duplicates)}")
+    logger.debug("%s: лист «%s», колонки таблицы: %s", source_name, title, header)
+
+    table = []
+    for row in rows[header_index + 1 :]:
+        cells = (list(row) + [None] * len(header))[: len(header)]  # ячейки правее заголовка не нужны
+        table.append({name: _cell_value(value) for name, value in zip(header, cells, strict=True) if name})
+    return table
+
+
+def load_ad_records(path: str | Path, column_mapping: Mapping[str, str] | None = None) -> list[DailyAdRecord]:
     """Читает выгрузку кабинета и валидирует каждую строку моделью DailyAdRecord.
 
-    Колонки — в нотации Reports API Директа (Date, CampaignName, Cost…). Если
-    CampaignId нет, он выводится из названия кампании (``campaign_id_from_name``).
+    Форматы: .csv (разделитель «,», «;» или табуляция), .tsv, .json (массив объектов),
+    .xlsx / .xlsm и .xls (Excel 97–2003). Колонки — в нотации Reports API Директа
+    (Date, CampaignName, Cost…); если в файле они называются иначе, ``column_mapping``
+    переименовывает их до валидации (``{"Затраты": "Cost"}``). Если CampaignId нет,
+    он выводится из названия кампании (``campaign_id_from_name``).
 
     Raises:
-        ValueError: неподдерживаемый формат или невалидная строка (с её номером).
+        ValueError: неподдерживаемый или повреждённый файл, нет обязательных колонок,
+            невалидная строка (с её номером).
     """
     source = Path(path)
-    return parse_ad_rows(_read_rows(source), source.name)
+    return parse_ad_rows(_read_rows(source, _mapping_lookup(column_mapping)), source.name, column_mapping)
 
 
-def parse_ad_rows(rows: Iterable[Any], source_name: str) -> list[DailyAdRecord]:
+def parse_ad_rows(
+    rows: Iterable[Any], source_name: str, column_mapping: Mapping[str, str] | None = None
+) -> list[DailyAdRecord]:
     """Валидирует строки выгрузки (словари с колонками Директа) — общий путь для файлов и API.
 
+    Колонки сначала переименовываются по ``column_mapping`` (см. ``normalize_columns``);
+    по первой строке проверяется, что обязательные колонки есть.
+
     Raises:
-        ValueError: строка не словарь или не прошла валидацию; в сообщении — её номер.
+        ValueError: строка не словарь, нет обязательных колонок или строка не прошла
+            валидацию; в сообщении — номер строки.
     """
+    lookup = _mapping_lookup(column_mapping)
     records = []
     synthetic_ids = 0
     for number, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
             raise ValueError(f"{source_name}, запись {number}: ожидается объект, получено {row!r}")
-        prepared = _with_campaign_id(row)
-        synthetic_ids += prepared is not row
+        try:
+            renamed = _rename_columns(row, lookup)
+        except ValueError as exc:
+            raise ValueError(f"{source_name}, запись {number}: {exc}") from exc
+        if number == 1:
+            _check_required_columns(renamed, source_name)
+        prepared = _with_campaign_id(renamed)
+        synthetic_ids += prepared is not renamed
         try:
             records.append(DailyAdRecord.model_validate(prepared))
         except ValidationError as exc:

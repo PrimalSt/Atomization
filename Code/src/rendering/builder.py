@@ -21,7 +21,7 @@ from pptx.slide import SlideLayout  # noqa: E402
 from src.config_loader import PROJECT_ROOT, load_report_config  # noqa: E402
 from src.console import configure_logging, use_utf8_console  # noqa: E402
 from src.data_loader import generate_mock_ad_data  # noqa: E402
-from src.rendering.context import RenderContext  # noqa: E402
+from src.rendering.context import MonthComparison, RenderContext  # noqa: E402
 from src.rendering.primitives import SLIDE_HEIGHT, SLIDE_WIDTH, add_footer, fill_background  # noqa: E402
 from src.rendering.slides import plan_slides, render_slide  # noqa: E402
 from src.schemas import (  # noqa: E402
@@ -46,6 +46,7 @@ def build_presentation(
     *,
     generated_at: dt.date | None = None,
     notes: ExpertNotes | None = None,
+    comparison: MonthComparison | None = None,
 ) -> Path:
     """Собирает презентацию из активных слайдов конфига и сохраняет её.
 
@@ -56,6 +57,7 @@ def build_presentation(
         output_path: путь к .pptx; недостающие папки создаются.
         generated_at: дата формирования на титульном слайде, по умолчанию сегодня.
         notes: выводы специалиста для слайда notes_slide; без них там будет заготовка.
+        comparison: итоги прошлого месяца из истории — карточки KPI покажут динамику MoM.
 
     Returns:
         Абсолютный путь к сохранённому файлу.
@@ -64,7 +66,7 @@ def build_presentation(
     if output_path.suffix.lower() != ".pptx":
         raise ValueError(f"Ожидается путь к файлу .pptx, получено: {output_path}")
 
-    ctx = RenderContext.from_data(config, summary, daily_records, generated_at or dt.date.today(), notes)
+    ctx = RenderContext.from_data(config, summary, daily_records, generated_at or dt.date.today(), notes, comparison)
     presentation = Presentation()
     presentation.slide_width = SLIDE_WIDTH
     presentation.slide_height = SLIDE_HEIGHT
